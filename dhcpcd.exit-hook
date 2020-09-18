@@ -1,0 +1,8 @@
+#!/bin/bash
+
+
+if [ "${interface}" = "eth0" ]; then
+  cd /home/pi/ddnsmart
+  sudo -u pi ./ddnsmart.py &
+fi
+

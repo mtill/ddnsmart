@@ -1,0 +1,16 @@
+{
+    "statefile": "/var/tmp/ddnsmart/state",
+    "ipv4check": {"type": "web", "uri": "http://checkip4.spdyn.de"},
+    "_ipv6check": {"type": "web", "uri": "http://checkip6.spdyn.de"},
+    "ipv6check": {"type": "proc", "networkinterface": "eth0"},
+    "maxAgeInSeconds": 86400,
+
+    "providers": {
+        "afraid.org": {
+            "ipv4uri": "https://freedns.afraid.org/dynamic/update.php?...",
+            "ipv4params": {"address": "<ipv4address>"},
+            "ipv6uri": "https://freedns.afraid.org/dynamic/update.php?...",
+            "ipv6params": {"address": "<ipv6address>"}
+        }
+    }
+}
