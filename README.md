@@ -1,5 +1,5 @@
-# ddnsmart
-ddnsmart is a small, extensible, and easy-to-use DDNS client.
+# ddnsmart - experimental DDNS client
+ddnsmart is a small, experimental DDNS client.
 
 
 ## configuration
