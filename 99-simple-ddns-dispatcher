@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+INTERFACE="$1"
+EVENT="$2"
+
+if [[ "$EVENT" == "dhcp6-change" ]]; then
+  /etc/serverscripts/simple-ddns.sh /etc/serverscripts/simple-ddns.config NetworkManager_dispatcher
+fi
+
