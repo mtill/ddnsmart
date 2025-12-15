@@ -41,7 +41,7 @@ def update_dns(ipaddr):
 
     current_ip=read_last_ip()
     nochg = current_ip == ipaddr
-    if nochg:
+    if not nochg:
         # this must be done before invoking UPDATE_CALL
         update_last_ip(new_ip=ipaddr)
 
