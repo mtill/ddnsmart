@@ -13,7 +13,7 @@ app = Flask(__name__)
 LAST_IP_FILE = Path("/tmp/ipv4-address-router.txt")
 ALWAYS_UPDATE = True
 WEB_SECRET_KEY = None
-UPDATE_CALL = ["/etc/serverscripts/simple-ddns-update-all.sh", "/etc/serverscripts/simple-ddns.config", 4, "simple-ddns-server.py"]
+UPDATE_CALL = ["/etc/serverscripts/simple-ddns-update-all.sh", "/etc/serverscripts/simple-ddns.config", "4", "simple-ddns-server.py"]
 
 
 def read_last_ip():
