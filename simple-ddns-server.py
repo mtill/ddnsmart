@@ -11,7 +11,6 @@ app = Flask(__name__)
 
 
 LAST_IP_FILE = Path("/tmp/ipv4-address-router.txt")
-ALWAYS_UPDATE = True
 WEB_SECRET_KEY = None
 UPDATE_CALL = ["/etc/serverscripts/simple-ddns-update-all.sh", "/etc/serverscripts/simple-ddns.config", "4", "simple-ddns-server.py"]
 
@@ -40,12 +39,16 @@ def update_dns(ipaddr):
     except socket.error:
         return "badip", 400
 
-    if not ALWAYS_UPDATE:
-        current_ip=read_last_ip()
-        if current_ip == ipaddr:
-            return "nochg", 200
+    current_ip=read_last_ip()
+    nochg = current_ip == ipaddr
+
+    # invoke update script, even iff ip did not change
+    subprocess.run(UPDATE_CALL)
+
+    if nochg:
+        return "nochg", 200
 
     update_last_ip(new_ip=ipaddr)
-    subprocess.run(UPDATE_CALL)
     return "good", 200
+
 
