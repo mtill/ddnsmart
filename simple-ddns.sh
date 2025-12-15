@@ -3,26 +3,62 @@
 
 [ "${FLOCKER_SIMPLE_DDNS}" != "$0" ] && exec env FLOCKER_SIMPLE_DDNS="$0" flock -e -w 10 "$0" "$0" "$@" || :
 
-LAST_IP_FILE="/tmp/simple_ddns_last_ipv6.txt"
-SKIP_FILE="/tmp/simple_ddns.lock"
-LOG_FILE="/tmp/simple_ddns.log"
+OPTS=$(getopt -o c:h:t:s: --long config_dir:,host:,trigger:,skip_duration_seconds: -n 'simple-ddns.sh' -- "$@")
+if [ $? -ne 0 ]; then
+  echo "Failed to parse options" >&2
+  exit 1
+fi
+
+## Reset the positional parameters to the parsed options
+eval set -- "$OPTS"
+
+## Process the options
+CONFIG_DIR="."
+HOST=""
+TRIGGER="manual"
 SKIP_DURATION_SECONDS=900
+while true; do
+  case "$1" in
+    -c | --config_dir)
+      CONFIG_DIR="$2"
+      shift 2
+      ;;
+    -h | --host)
+      HOST="$2"
+      shift 2
+      ;;
+    -t | --trigger)
+      TRIGGER="$2"
+      shift 2
+      ;;
+    -d | --duration_seconds)
+      SKIP_DURATION_SECONDS="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "internal error"
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "${HOST}" ]; then
+  echo "error: please specify host"
+  exit 1
+fi
+
+LAST_IP_FILE="/tmp/simple_ddns_last_ipv6-$HOST.txt"
+SKIP_FILE="/tmp/simple_ddns-$HOST.lock"
+LOG_FILE="/tmp/simple_ddns-$HOST.log"
 SUCCESS_RESPONSE_PATTERNS="good|nochg"
 
 
 # read config file
-if [ -v 1 ]; then
-  source "$1"
-else
-  echo "ERROR: path to config file not specified."
-  exit 1
-fi
-
-
-TRIGGER="manual"
-if [ -v 2 ]; then
-  TRIGGER="$2"
-fi
+source "$CONFIG_DIR/$HOST"
 
 
 set_skip_timer() {
