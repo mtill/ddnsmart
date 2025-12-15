@@ -3,7 +3,8 @@
 
 [ "${FLOCKER_SIMPLE_DDNS}" != "$0" ] && exec env FLOCKER_SIMPLE_DDNS="$0" flock -e -w 10 "$0" "$0" "$@" || :
 
-OPTS=$(getopt -o c:h:t:s: --long config_dir:,host:,trigger:,skip_duration_seconds: -n 'simple-ddns.sh' -- "$@")
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+OPTS=$(getopt -o c:h:t: --long config_dir:,host:,trigger: -n 'simple-ddns.sh' -- "$@")
 if [ $? -ne 0 ]; then
   echo "Failed to parse options" >&2
   exit 1
@@ -15,8 +16,10 @@ eval set -- "$OPTS"
 ## Process the options
 CONFIG_DIR="."
 HOST=""
+GET_IP_SCRIPT=""
 TRIGGER="manual"
 SKIP_DURATION_SECONDS=900
+
 while true; do
   case "$1" in
     -c | --config_dir)
@@ -29,10 +32,6 @@ while true; do
       ;;
     -t | --trigger)
       TRIGGER="$2"
-      shift 2
-      ;;
-    -d | --duration_seconds)
-      SKIP_DURATION_SECONDS="$2"
       shift 2
       ;;
     --)
@@ -51,15 +50,20 @@ if [ -z "${HOST}" ]; then
   exit 1
 fi
 
-LAST_IP_FILE="/tmp/simple_ddns_last_ipv6-$HOST.txt"
+LAST_IP_FILE="/tmp/simple_ddns-$HOST.lastip"
 SKIP_FILE="/tmp/simple_ddns-$HOST.lock"
 LOG_FILE="/tmp/simple_ddns-$HOST.log"
 SUCCESS_RESPONSE_PATTERNS="good|nochg"
+MAX_AGE_SECONDS=86400  # 24 hours * 60 minutes * 60 seconds
 
 
 # read config file
 source "$CONFIG_DIR/$HOST"
 
+if [ -z "${GET_IP_SCRIPT}" ]; then
+  echo "error: GET_IP_SCRIPT not specified."
+  exit 1
+fi
 
 set_skip_timer() {
     local CURRENT_TIME=$(date +%s)
@@ -91,16 +95,17 @@ check_skip_timer() {
     fi
 }
 
-get_current_ipv6() {
-    echo $(ip -6 addr list scope global eth0 | grep -v " fd" | sed -n 's/.*inet6 \([0-9a-f:]\+\).*/\1/p' | head -n 1)
-}
-
-read_last_ipv6() {
+read_last_ip() {
     if [ -f "$LAST_IP_FILE" ]; then
-        cat "$LAST_IP_FILE"
-    else
-      echo ""
+        FILE_MOD_TIME=$(stat -c %Y "$LAST_IP_FILE")
+	CURRENT_TIME=$(date +%s)
+	FILE_AGE_SECONDS=$((CURRENT_TIME - FILE_MOD_TIME))
+	if [ "$FILE_AGE_SECONDS" -lt "$MAX_AGE_SECONDS" ]; then
+          cat "$LAST_IP_FILE"
+        fi
     fi
+
+    echo ""
 }
 
 send_ddns_update_and_check() {
@@ -124,19 +129,19 @@ if check_skip_timer; then
 fi
 
 
-LAST_IPV6="$(read_last_ipv6)"
-CURRENT_IPV6="$(get_current_ipv6)"
+LAST_IP="$(read_last_ip)"
+CURRENT_IP="$($GET_IP_SCRIPT)"
 
-if [[ -z "$CURRENT_IPV6" ]]; then
-    echo "$(date) [${TRIGGER}]: ERROR: could not get current IPv6 address." >> $LOG_FILE
+if [[ -z "$CURRENT_IP" ]]; then
+    echo "$(date) [${TRIGGER}]: ERROR: could not get current IP address." >> $LOG_FILE
     exit 1
 fi
 
-if [ "$CURRENT_IPV6" != "$LAST_IPV6" ]; then
-    echo "$(date) [${TRIGGER}]: IPv6 address updated - old: $LAST_IPV6 | new: $CURRENT_IPV6" >> $LOG_FILE
+if [ "$CURRENT_IP" != "$LAST_IP" ]; then
+    echo "$(date) [${TRIGGER}]: IP address updated - old: $LAST_IP | new: $CURRENT_IP" >> $LOG_FILE
 
-    if send_ddns_update_and_check "$CURRENT_IPV6"; then
-        echo "$CURRENT_IPV6" > "$LAST_IP_FILE"
+    if send_ddns_update_and_check "$CURRENT_IP"; then
+        echo "$CURRENT_IP" > "$LAST_IP_FILE"
         clear_skip_flag
     else
         set_skip_timer
@@ -150,4 +155,5 @@ else
 fi
 
 exit 0
+
 
