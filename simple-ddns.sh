@@ -69,7 +69,7 @@ set_skip_timer() {
     local CURRENT_TIME=$(date +%s)
     local SKIP_UNTIL=$((CURRENT_TIME + SKIP_DURATION_SECONDS))
     echo "$SKIP_UNTIL" > "$SKIP_FILE"
-    echo "$(date) [${TRIGGER}]: setting skip timer - next run: $(date -d @${SKIP_UNTIL})." >> $LOG_FILE
+    echo "$(date) [${TRIGGER}]: BLOCKING for ${SKIP_DURATION_SECONDS}s." >> $LOG_FILE
 }
 
 clear_skip_flag() {
@@ -83,7 +83,7 @@ check_skip_timer() {
         
         if [ "$CURRENT_TIME" -lt "$SKIP_UNTIL_TIMESTAMP" ]; then
             local REMAINING_SECONDS=$((SKIP_UNTIL_TIMESTAMP - CURRENT_TIME))
-	    echo "$(date) [${TRIGGER}]: ** SKIP-TIMER ACTIVE - remaining seconds: ${REMAINING_SECONDS}s. **" >> $LOG_FILE
+	    echo "$(date) [${TRIGGER}]: ** BLOCKED - remaining seconds: ${REMAINING_SECONDS}s. **" >> $LOG_FILE
             return 0 # Timer aktiv: SKIP
         else
             # timer expired
@@ -145,7 +145,7 @@ if [ "$CURRENT_IP" != "$LAST_IP" ]; then
         clear_skip_flag
     else
         set_skip_timer
-        echo "$(date) [${TRIGGER}]: FAIL: Updating DDNS record failed - setting 15 min timer" >> $LOG_FILE
+        echo "$(date) [${TRIGGER}]: FAIL: Updating DDNS record failed." >> $LOG_FILE
         exit 1
     fi
     
