@@ -105,9 +105,9 @@ read_last_ip() {
         else
           echo "outdated"
         fi
+    else
+        echo "none"
     fi
-
-    echo "none"
 }
 
 send_ddns_update_and_check() {
