@@ -10,7 +10,7 @@ import socket # Used for simple IP validation
 app = Flask(__name__)
 
 
-LAST_IP_FILE = Path("/tmp/ipv4-address-router.txt")
+LAST_IP_FILE = Path("/var/tmp/simple-ddns-ipv4-address-router.txt")
 WEB_SECRET_KEY = None
 UPDATE_CALL = ["/etc/serverscripts/simple-ddns-update-all.sh", "/etc/serverscripts/simple-ddns.config", "4", "simple-ddns-server.py"]
 

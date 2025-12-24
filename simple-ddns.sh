@@ -50,11 +50,11 @@ if [ -z "${HOST}" ]; then
   exit 1
 fi
 
-LAST_IP_FILE="/tmp/simple_ddns-$HOST.lastip"
+LAST_IP_FILE="/var/tmp/simple_ddns-$HOST.lastip"
 SKIP_FILE="/tmp/simple_ddns-$HOST.lock"
-LOG_FILE="/tmp/simple_ddns-$HOST.log"
+LOG_FILE="/var/log/simple_ddns-$HOST.log"
 SUCCESS_RESPONSE_PATTERNS="good|nochg"
-MAX_AGE_SECONDS=86400  # 24 hours * 60 minutes * 60 seconds
+MAX_AGE_SECONDS=172800  # 2 * 24 hours * 60 minutes * 60 seconds
 
 
 # read config file
