@@ -100,12 +100,14 @@ read_last_ip() {
         FILE_MOD_TIME=$(stat -c %Y "$LAST_IP_FILE")
 	CURRENT_TIME=$(date +%s)
 	FILE_AGE_SECONDS=$((CURRENT_TIME - FILE_MOD_TIME))
-	if [ "$FILE_AGE_SECONDS" -lt "$MAX_AGE_SECONDS" ]; then
+	if [ "$FILE_AGE_SECONDS" -le "$MAX_AGE_SECONDS" ]; then
           cat "$LAST_IP_FILE"
+        else
+          echo "outdated"
         fi
     fi
 
-    echo ""
+    echo "none"
 }
 
 send_ddns_update_and_check() {
