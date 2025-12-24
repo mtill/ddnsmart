@@ -51,7 +51,7 @@ if [ -z "${HOST}" ]; then
 fi
 
 LAST_IP_FILE="/var/tmp/simple_ddns-$HOST.lastip"
-SKIP_FILE="/tmp/simple_ddns-$HOST.lock"
+SKIP_FILE="/var/lock/simple_ddns-$HOST.lock"
 LOG_FILE="/var/log/simple_ddns-$HOST.log"
 SUCCESS_RESPONSE_PATTERNS="good|nochg"
 MAX_AGE_SECONDS=172800  # 2 * 24 hours * 60 minutes * 60 seconds
