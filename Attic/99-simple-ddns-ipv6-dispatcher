@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+INTERFACE="$1"
+EVENT="$2"
+CONFIG_PATH="/etc/serverscripts/simple-ddns.config"
+LOG_FILE="/var/log/simple_ddns_dispatcher_debug.log"
+
+if [[ "$EVENT" == "check" || "$EVENT" == "up" || "$EVENT" == "dhcp6-change" ]]; then
+  /etc/serverscripts/simple-ddns-update-all.sh "$CONFIG_PATH" 6 "NetworkManager_dispatcher_$EVENT"
+else
+  echo "$(date) [NetworkManager]: IGNORING EVENT ${EVENT} " >> $LOG_FILE
+fi
+
