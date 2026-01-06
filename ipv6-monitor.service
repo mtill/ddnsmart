@@ -1,6 +1,7 @@
 [Unit]
 Description=Real-time IPv6 Address Monitor
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/etc/serverscripts/ipv6-monitor.sh
