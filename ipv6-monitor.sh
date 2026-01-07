@@ -6,6 +6,14 @@ IIFACE=$(ip -6 route show default | awk '{print $5}' | head -n1)
 CONFIG_PATH="/etc/serverscripts/simple-ddns.config"
 LAST_IP=""
 
+
+function run_update {
+  /etc/serverscripts/simple-ddns-update-all.sh "$CONFIG_PATH" 6 ipv6-monitor
+}
+
+
+run_update
+
 # This monitor listens for any IPv6 address addition/update
 ip -6 monitor addr | while read -r line; do
     # Check if the line indicates an address was added/updated
@@ -20,7 +28,7 @@ ip -6 monitor addr | while read -r line; do
         # (Or remove 'grep -v temporary' if you DO want privacy addresses)
         if [[ "$IFACE" == "$IIFACE" ]] && [[ "$SCOPE" == "global" ]] && [[ ! "$line" =~ "temporary" ]] && [[ ! "$ADDR" == fd* ]] && [[ "$ADDR" != "$LAST_IP" ]]; then
             logger "IPv6 Monitor detected change: $ADDR on $IFACE"
-	    /etc/serverscripts/simple-ddns-update-all.sh "$CONFIG_PATH" 6 ipv6-monitor
+	    run_update
 	    LAST_IP="$ADDR"
         fi
     fi
