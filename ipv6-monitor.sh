@@ -12,26 +12,35 @@ function run_update {
 }
 
 
+logger "IPv6 Monitor: init"
 run_update
 
 # This monitor listens for any IPv6 address addition/update
-ip -6 monitor addr | while read -r line; do
+while read -r line; do
+    # skip lines that don't have what we need
+    [[ "$line" != *"inet6"* ]] && continue
+    [[ "$line" == *"temporary"* ]] && continue
+    [[ "$line" == *"deleted"* ]] && continue
+
     # Check if the line indicates an address was added/updated
-    if echo "$line" | grep -q "inet6"; then
-        # Extract the interface and the address
-        # Example line: "2: eth0    inet6 2001:db8::1/64 scope global ..."
-        IFACE=$(echo "$line" | awk '{print $2}')
-        ADDR=$(echo "$line" | grep -oP 'inet6 \K[0-9a-fA-F:]+')
+    # Extract the interface and the address
+    # Example line: "2: eth0    inet6 2001:db8::1/64 scope global ..."
+    ADDR=$(echo "$line" | grep -oP 'inet6 \K[0-9a-fA-F:]+')
+    [[ -z "$ADDR" ]] || [[ "$ADDR" == fd* ]] && continue
+
+    if [[ "$line" == *"$IIFACE"* ]]; then
         SCOPE=$(echo "$line" | grep -oP 'scope \K\w+')
 
         # Filter: Only act on global, non-temporary addresses 
         # (Or remove 'grep -v temporary' if you DO want privacy addresses)
-        if [[ "$IFACE" == "$IIFACE" ]] && [[ "$SCOPE" == "global" ]] && [[ ! "$line" =~ "temporary" ]] && [[ ! "$ADDR" == fd* ]] && [[ "$ADDR" != "$LAST_IP" ]]; then
-            logger "IPv6 Monitor detected change: $ADDR on $IFACE"
-	    run_update
-	    LAST_IP="$ADDR"
+        if [[ "$SCOPE" == "global" ]] && [[ "$ADDR" != "$LAST_IP" ]]; then
+            logger "IPv6 Monitor detected change: $ADDR on $IIFACE"
+            run_update
+            LAST_IP="$ADDR"
         fi
+
     fi
-done
+
+done < <(ip -6 monitor addr)
 
 
