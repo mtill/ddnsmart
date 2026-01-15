@@ -136,6 +136,7 @@ CURRENT_IP="$($GET_IP_SCRIPT)"
 
 if [[ -z "$CURRENT_IP" ]]; then
     echo "$(date) [${TRIGGER}]: ERROR: could not get current IP address." >> $LOG_FILE
+    set_skip_timer
     exit 1
 fi
 
