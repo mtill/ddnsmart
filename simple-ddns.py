@@ -135,7 +135,7 @@ class DDNSUpdater:
     def monitor_loop(self):
         with IPRoute() as ipr:
             ipr.bind()
-            print("Monitoring Public IPv6 address changes...")
+            logging.info("Monitoring Public IPv6 address changes...")
 
             while True:
                 for msg in ipr.get():
@@ -154,18 +154,19 @@ class DDNSUpdater:
             self.update_ip(initial_ip, "Startup Sync")
 
         # 3. Main thread handles the configurable heartbeat sleep
-        logging.info(f"Daemon running. Heartbeat check every {self.heartbeat_interval} seconds.")
+        logging.info(f"Daemon running. Heartbeat check every ~{self.heartbeat_interval} seconds.")
         while True:
-            time.sleep(self.heartbeat_interval)
-
-            current_ip = self.get_current_ipv6()
-            if current_ip is not None:
-                self.update_ip(current_ip, "Heartbeat")
+            # sleep for 1 hour and check whether hearbeat interval has passed since last update
+            time.sleep(3600)  # Sleep for 1 hour
+            if time.time() - self.last_update_time >= self.heartbeat_interval:
+                current_ip = self.get_current_ipv6()
+                if current_ip is not None:
+                    self.update_ip(current_ip, "Heartbeat")
 
 
 if __name__ == "__main__":
     config_dir = pathlib.Path(__file__).parent / "config" if len(sys.argv) == 1 else pathlib.Path(sys.argv[1])
-    print("Starting simple-ddns with config directory:", config_dir)
+    logging.info(f"Starting simple-ddns with config directory: {config_dir}")
     if not config_dir.is_dir():
         logging.error(f"Config directory '{config_dir}' not found.")
         sys.exit(1)
