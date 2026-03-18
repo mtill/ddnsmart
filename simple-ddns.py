@@ -160,7 +160,8 @@ class DDNSUpdater:
 
 
 if __name__ == "__main__":
-    config_dir = pathlib.Path("config")
+    config_dir = pathlib.Path(__file__).parent / "config" if len(sys.argv) == 1 else pathlib.Path(sys.argv[1])
+    print("Starting simple-ddns with config directory:", config_dir)
     if not config_dir.is_dir():
         logging.error(f"Config directory '{config_dir}' not found.")
         sys.exit(1)
