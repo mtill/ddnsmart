@@ -4,13 +4,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Replace 'username' with your actual Linux username
-User=username
-Group=username
-
-# Path to your script and the working directory
-WorkingDirectory=/home/username/scripts
-ExecStart=/usr/bin/python3 /home/username/scripts/ddns_monitor.py
+WorkingDirectory=%h/ddnsmart
+ExecStart=/usr/bin/python3 %h/ddnsmart/simple-ddns.py
 
 Restart=always
 RestartSec=120
