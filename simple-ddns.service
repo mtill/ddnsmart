@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=%h/ddnsmart
-ExecStart=/usr/bin/python3 %h/ddnsmart/simple-ddns.py %h/ddsmart/config
+ExecStart=/usr/bin/python3 %h/ddnsmart/simple-ddns.py %h/ddnsmart/config
 
 Restart=always
 RestartSec=120

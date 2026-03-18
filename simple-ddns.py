@@ -24,10 +24,11 @@ logging.basicConfig(
 
 
 class DDNSUpdater:
-    def __init__(self, interface_name, state_file, heartbeat_interval, ddns_url):
+    def __init__(self, user_agent, interface_name, state_file, heartbeat_interval, ddns_url):
         self.lock = threading.Lock()
         
         # Configuration with defaults
+        self.user_agent = user_agent
         self.interface_name = interface_name
         self.state_file = state_file
         self.heartbeat_interval = heartbeat_interval
@@ -45,7 +46,7 @@ class DDNSUpdater:
 
     def parse_ipv6_address(self, msg):
         # 1. Filter for IPv6
-        if msg.get('family') == socket.AF_INET6 and msg['event'] == rtnl.RTM_NEWADDR:
+        if msg.get('family') == socket.AF_INET6 and msg['event'] == "RTM_NEWADDR":
             if msg.get('index') != self.interface_index:
                 return None
 
@@ -98,11 +99,12 @@ class DDNSUpdater:
             if new_ip == self.last_ip and reason != "Heartbeat":
                 return
 
+            update_url = self.ddns_url.replace("<ipv6address>", new_ip)
             try:
                 logging.info(f"Updating DDNS ({reason}): {new_ip}")
                 req = urllib.request.Request(
-                    f"{self.ddns_url}{new_ip}", 
-                    headers={'User-Agent': 'simple-ddns/1.0'}
+                    f"{update_url}", 
+                    headers={'User-Agent': self.user_agent}
                 )
 
                 with urllib.request.urlopen(req, timeout=10) as resp:
@@ -150,7 +152,7 @@ class DDNSUpdater:
 
         # 2. Initial sync
         initial_ip = self.get_current_ipv6()
-        if initial_ip:
+        if initial_ip is not None:
             self.update_ip(initial_ip, "Startup Sync")
 
         # 3. Main thread handles the configurable heartbeat sleep
@@ -177,8 +179,9 @@ if __name__ == "__main__":
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        updater = DDNSUpdater(interface_name=config.get("interface_name"),
-                            state_file=config.get("state_file", "current_ipv6.txt"),
+        updater = DDNSUpdater(user_agent=config.get("user_agent", "ddclient/3.10.0"),
+                            interface_name=config.get("interface_name"),
+                            state_file=config.get("state_file", "/var/tmp/ddnsmart_current_ipv6.txt"),
                             heartbeat_interval=config.get("heartbeat_interval", 86400),
                             ddns_url=config.get("ddns_url", ""))
         updater.run()
