@@ -60,13 +60,16 @@ class DDNSUpdater:
             if flags & (ifaddrmsg.IFA_F_TEMPORARY | 
                         ifaddrmsg.IFA_F_TENTATIVE |
                         ifaddrmsg.IFA_F_OPTIMISTIC |
+                        ifaddrmsg.IFA_F_DEPRECATED |
                         ifaddrmsg.IFA_F_DADFAILED):
                 return None
 
             # 2. Filter for Global Scope (Public addresses)
             # Scope 0 is 'universe' (global), 253 is 'link'
             if msg.get('scope') == 0:
-                return msg.get_attr('IFA_ADDRESS')
+                result = msg.get_attr('IFA_ADDRESS')
+                if not result.startswith('fdde:'):
+                    return result
 
         return None
 
@@ -125,7 +128,7 @@ class DDNSUpdater:
     def get_current_ipv6(self):
         with IPRoute() as ipr:
             # Get all IPv6 addresses for the interface
-            addresses = ipr.get_addr(index=self.interface_index, family=socket.AF_INET6)
+            addresses = ipr.get_addr(index=self.interface_index, family=socket.AF_INET6, scope=0)
 
             for msg in addresses:
                 address = self.parse_ipv6_address(msg=msg)
