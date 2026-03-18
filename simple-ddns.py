@@ -18,7 +18,6 @@ from pyroute2.netlink.rtnl import ifaddrmsg
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO, 
-    filename='/var/tmp/ddnsmart/simple-ddns.log',
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
