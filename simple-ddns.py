@@ -183,6 +183,8 @@ class DDNSUpdater:
             if time.time() - self.last_update_time >= self.heartbeat_interval:
                 current_ip = self.get_current_ipv6()
                 if current_ip is not None:
+                    if self.update_timer is not None and self.update_timer.is_alive():
+                        self.update_timer.cancel()
                     self.update_ip(current_ip, "Heartbeat")
 
 
