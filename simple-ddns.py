@@ -38,6 +38,8 @@ class DDNSUpdater:
         self.last_ip = self._load_last_ip()
         self.last_update_time = time.time()
 
+        self.update_timer = None
+
         with IPRoute() as ipr:
             links = ipr.link_lookup(ifname=self.interface_name)
             if not links:
@@ -56,10 +58,21 @@ class DDNSUpdater:
             #IFA_F_TEMPORARY: This is a Privacy Extension address (rotates frequently).
             #IFA_F_DEPRECATED: The address is deprecated (usually happens before a prefix change).
 
-            flags = msg.get_attr('IFA_FLAGS') or 0
+            flags = msg.get_attr('IFA_FLAGS')
+            # If the kernel didn't provide IFA_FLAGS (rare for IPv6), 
+            # fall back to the header flags
+            if flags is None:
+                flags = msg['flags']
+
+            logging.debug(f"Received address event: {msg.get_attr('IFA_ADDRESS')} with flags {msg.get_attr('IFA_FLAGS')}")
+
+            # Select ONLY MAC-derived addresses (EUI-64):
+            # Must have PERMANENT flag and NOT have TEMPORARY flag
+            #if not (flags & ifaddrmsg.IFA_F_PERMANENT):
+            #    return None
+
             if flags & (ifaddrmsg.IFA_F_TEMPORARY | 
                         ifaddrmsg.IFA_F_TENTATIVE |
-                        ifaddrmsg.IFA_F_OPTIMISTIC |
                         ifaddrmsg.IFA_F_DEPRECATED |
                         ifaddrmsg.IFA_F_DADFAILED):
                 return None
@@ -122,6 +135,7 @@ class DDNSUpdater:
                     self.last_update_time = now
                     with open(self.state_file, "w") as f:
                         f.write(new_ip)
+
             except Exception as e:
                 logging.error(f"API Update Failed: {e}")
 
@@ -147,7 +161,10 @@ class DDNSUpdater:
                     address = self.parse_ipv6_address(msg=msg)
                     if address is not None:
                         # 10s delay to ensure the address is fully 'preferred' by the OS
-                        threading.Timer(10, self.update_ip, args=(address, "Kernel Event")).start()
+                        if self.update_timer is not None and self.update_timer.is_alive():
+                            self.update_timer.cancel()
+                        self.update_timer = threading.Timer(15, self.update_ip, args=(address, "Kernel Event"))
+                        self.update_timer.start()
 
     def run(self):
         # 1. Start Kernel Listener in background
