@@ -23,28 +23,29 @@ logging.basicConfig(
 )
 
 
-class DDNSUpdater:
-    def __init__(self, user_agent, interface_name, state_file, heartbeat_interval, ddns_url):
-        self.lock = threading.Lock()
-        
-        # Configuration with defaults
-        self.user_agent = user_agent
+class DDNSInterface:
+    def __init__(self, interface_name, ddns_services, check_interval):
         self.interface_name = interface_name
-        self.state_file = state_file
-        self.heartbeat_interval = heartbeat_interval
-        self.ddns_url = ddns_url
-
-        # State tracking
-        self.last_ip = self._load_last_ip()
-        self.last_update_time = time.time()
-
-        self.update_timer = None
+        self.ddns_services = ddns_services
+        self.check_interval = check_interval
 
         with IPRoute() as ipr:
-            links = ipr.link_lookup(ifname=self.interface_name)
+            links = ipr.link_lookup(ifname=interface_name)
             if not links:
-                raise ValueError(f"Error: Interface {self.interface_name} not found.")
+                raise ValueError(f"Error: Interface {interface_name} not found.")
             self.interface_index = links[0]
+
+    def get_current_ipv6(self):
+        with IPRoute() as ipr:
+            # Get all IPv6 addresses for the interface
+            addresses = ipr.get_addr(index=self.interface_index, family=socket.AF_INET6, scope=0)
+
+            for msg in addresses:
+                address = self.parse_ipv6_address(msg=msg)
+                if address is not None:
+                    return address
+
+        return None
 
     def parse_ipv6_address(self, msg):
         # 1. Filter for IPv6
@@ -86,6 +87,79 @@ class DDNSUpdater:
 
         return None
 
+    def _propagate_update(self, new_ip, reason="Change", force_update=False):
+        for ddns_service in self.ddns_services:
+            if ddns_service.update_timer is not None and ddns_service.update_timer.is_alive():
+                ddns_service.update_timer.cancel()
+            # 15s delay to ensure the address is fully 'preferred' by the OS
+            ddns_service.update_timer = threading.Timer(15, ddns_service.update_ip, args=(new_ip, reason, force_update))
+            ddns_service.update_timer.start()
+
+    def monitor_loop(self):
+        with IPRoute() as ipr:
+            ipr.bind()
+            logging.info("Monitoring Public IPv6 address changes...")
+
+            while True:
+                for msg in ipr.get():
+                    address = self.parse_ipv6_address(msg=msg)
+                    if address is not None:
+                        self._propagate_update(new_ip=address, reason="Kernel Event", force_update=False)
+
+    def check_ip_loop(self):
+        logging.info(f"Interface daemon running. IP check every ~{self.check_interval} seconds.")
+        while True:
+            time.sleep(self.check_interval)
+            current_ip = self.get_current_ipv6()
+            if current_ip is not None:
+                if current_ip != self.last_ip:
+                    logging.info("We missed an IP address change since last update.")
+                    self._propagate_update(new_ip=current_ip, reason="missed", force_update=False)
+
+    def run(self):
+        # 1. Start Kernel Listener in background
+        threading.Thread(target=self.monitor_loop, daemon=True).start()
+
+        # 2. Initial sync
+        initial_ip = self.get_current_ipv6()
+        if initial_ip is not None:
+            self._propagate_update(new_ip=initial_ip, reason="Startup Sync", force_update=False)
+
+        # 3. double-check "manually" whether ip address changed, to avoid missing updates if the kernel event is somehow delayed or missed
+        threading.Thread(target=self.check_ip_loop, daemon=True).start()
+
+
+class DDNSService:
+    def __init__(self, name, user_agent, state_file, heartbeat_interval, update_url, retry_delay):
+        self.lock = threading.Lock()
+        
+        # Configuration with defaults
+        self.name = name
+        self.user_agent = user_agent
+        self.state_file = state_file
+        self.heartbeat_interval = heartbeat_interval
+        self.update_url = update_url
+        self.retry_delay = retry_delay
+
+        # State tracking
+        self.last_ip = self._load_last_ip()
+        self.last_update_time = time.time()
+
+        self.update_timer = None
+        self.heartbeat_timer = None
+        self._restart_heartbeat()
+        logging.info(f"[{self.name}] Heartbeat daemon running. Sending force-updates every ~{self.heartbeat_interval} seconds.")
+
+    def _send_heartbeat(self):
+        self.update_ip(self.last_ip, reason="Heartbeat", force_update=True)
+        self._restart_heartbeat()
+
+    def _restart_heartbeat(self):
+        if self.heartbeat_timer is not None and self.heartbeat_timer.is_alive():
+            self.heartbeat_timer.cancel()
+        self.heartbeat_timer = threading.Timer(self.heartbeat_interval, self._send_heartbeat)
+        self.heartbeat_timer.start()
+
     def _load_last_ip(self):
         try:
             with open(self.state_file, "r") as f:
@@ -107,17 +181,18 @@ class DDNSUpdater:
         # Default to success for unknown responses (avoid unnecessary retries)
         return True
 
-    def update_ip(self, new_ip, reason="Change"):
+    def update_ip(self, new_ip, reason="Change", force_update=False):
         """Thread-safe update with state persistence."""
         with self.lock:
+            self._restart_heartbeat()  # Reset heartbeat timer on any update attempt
             now = time.time()
-            # Skip if IP is identical unless it's a forced heartbeat
-            if new_ip == self.last_ip and reason != "Heartbeat":
+            # Skip if IP is identical unless it's a forced update
+            if new_ip == self.last_ip and not force_update:
                 return
 
-            update_url = self.ddns_url.replace("<ipv6address>", new_ip)
+            update_url = self.update_url.replace("<ipv6address>", new_ip)
             try:
-                logging.info(f"Updating DDNS ({reason}): {new_ip}")
+                logging.info(f"[{self.name}] Updating DDNS ({reason}): {new_ip}")
                 req = urllib.request.Request(
                     f"{update_url}", 
                     headers={'User-Agent': self.user_agent}
@@ -125,10 +200,10 @@ class DDNSUpdater:
 
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     result = resp.read().decode('utf-8').strip()
-                    logging.info(f"API Response: {result}")
+                    logging.info(f"[{self.name}] API Response: {result}")
 
                     if not self._response_ok(result):
-                        raise ValueError(f"Negative response from provider: {result}")
+                        raise ValueError(f"[{self.name}] Negative response from provider: {result}")
 
                     # Persist state
                     self.last_ip = new_ip
@@ -137,55 +212,11 @@ class DDNSUpdater:
                         f.write(new_ip)
 
             except Exception as e:
-                logging.error(f"API Update Failed: {e}")
-
-    def get_current_ipv6(self):
-        with IPRoute() as ipr:
-            # Get all IPv6 addresses for the interface
-            addresses = ipr.get_addr(index=self.interface_index, family=socket.AF_INET6, scope=0)
-
-            for msg in addresses:
-                address = self.parse_ipv6_address(msg=msg)
-                if address is not None:
-                    return address
-
-        return None
-
-    def monitor_loop(self):
-        with IPRoute() as ipr:
-            ipr.bind()
-            logging.info("Monitoring Public IPv6 address changes...")
-
-            while True:
-                for msg in ipr.get():
-                    address = self.parse_ipv6_address(msg=msg)
-                    if address is not None:
-                        # 10s delay to ensure the address is fully 'preferred' by the OS
-                        if self.update_timer is not None and self.update_timer.is_alive():
-                            self.update_timer.cancel()
-                        self.update_timer = threading.Timer(15, self.update_ip, args=(address, "Kernel Event"))
-                        self.update_timer.start()
-
-    def run(self):
-        # 1. Start Kernel Listener in background
-        threading.Thread(target=self.monitor_loop, daemon=True).start()
-
-        # 2. Initial sync
-        initial_ip = self.get_current_ipv6()
-        if initial_ip is not None:
-            self.update_ip(initial_ip, "Startup Sync")
-
-        # 3. Main thread handles the configurable heartbeat sleep
-        logging.info(f"Daemon running. Heartbeat check every ~{self.heartbeat_interval} seconds.")
-        while True:
-            # sleep for 1 hour and check whether hearbeat interval has passed since last update
-            time.sleep(3600)  # Sleep for 1 hour
-            if time.time() - self.last_update_time >= self.heartbeat_interval:
-                current_ip = self.get_current_ipv6()
-                if current_ip is not None:
-                    if self.update_timer is not None and self.update_timer.is_alive():
-                        self.update_timer.cancel()
-                    self.update_ip(current_ip, "Heartbeat")
+                logging.error(f"[{self.name}] API Update Failed: {e}")
+                if self.update_timer is not None and self.update_timer.is_alive():
+                    self.update_timer.cancel()
+                self.update_timer = threading.Timer(self.retry_delay, self.update_ip, args=(new_ip, "retry", False))
+                self.update_timer.start()
 
 
 if __name__ == "__main__":
@@ -201,10 +232,17 @@ if __name__ == "__main__":
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        updater = DDNSUpdater(user_agent=config.get("user_agent", "ddclient/3.10.0"),
-                            interface_name=config.get("interface_name"),
-                            state_file=config.get("state_file", "/var/tmp/ddnsmart_current_ipv6.txt"),
-                            heartbeat_interval=config.get("heartbeat_interval", 86400),
-                            ddns_url=config.get("ddns_url", ""))
-        updater.run()
+        ddns_services = []
+        for provider_name, conf_ddns_provider in config.get("ddns_providers", {}).items():
+            last_ip_filename = pathlib.Path("/var/tmp") / ("ddnsmart_" + provider_name + "_ipv6.txt")
+            ddns_service = DDNSService(name=provider_name,
+                                       user_agent=conf_ddns_provider.get("user_agent", "ddclient/3.10.0"),
+                                       state_file=conf_ddns_provider.get("state_file", last_ip_filename),
+                                       heartbeat_interval=conf_ddns_provider.get("heartbeat_interval", 86400),
+                                       update_url=conf_ddns_provider.get("update_url", ""),
+                                       retry_delay=conf_ddns_provider.get("retry_delay", 300))
+            ddns_services.append(ddns_service)
+
+        ddns_interface = DDNSInterface(interface_name=config.get("interface_name"), ddns_services=ddns_services, check_interval=config.get("check_interval", 900))
+        ddns_interface.run()
 
