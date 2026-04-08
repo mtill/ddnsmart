@@ -18,11 +18,10 @@ from pyroute2.netlink.rtnl import ifaddrmsg
 
 
 # --- Logging Setup ---
-_log_handlers = [logging.StreamHandler(sys.stdout)]
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=_log_handlers
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 
@@ -31,9 +30,8 @@ class DDNSInterface:
         self.interface_name = interface_name
         self.ddns_services = ddns_services
         self.check_interval = check_interval
-        self._shutdown = False  # Flag to gracefully stop threads
-        self._threads = []  # Track threads for cleanup
-        self._services_updated = threading.Event()  # Signal when services are added
+        self._shutdown = False
+        self._threads = []
 
         with IPRoute() as ipr:
             links = ipr.link_lookup(ifname=interface_name)
@@ -54,53 +52,28 @@ class DDNSInterface:
         return None
 
     def parse_ipv6_address(self, msg):
-        # 1. Filter for IPv6
-        if msg.get('family') == socket.AF_INET6 and msg.get('event') == "RTM_NEWADDR":
-            if msg.get('index') != self.interface_index:
-                return None
+        if msg.get('family') != socket.AF_INET6 or msg.get('event') != "RTM_NEWADDR":
+            return None
+        if msg.get('index') != self.interface_index:
+            return None
 
-            #Summary of Flags to watch:
-            #IFA_F_TENTATIVE: Address is being verified. Do not use yet.
-            #IFA_F_PERMANENT: This is a standard static or EUI-64 address.
-            #IFA_F_TEMPORARY: This is a Privacy Extension address (rotates frequently).
-            #IFA_F_DEPRECATED: The address is deprecated (usually happens before a prefix change).
+        flags = msg.get_attr('IFA_FLAGS') or msg.get('flags')
+        if flags is None:
+            return None
 
-            flags = msg.get_attr('IFA_FLAGS')
-            # If the kernel didn't provide IFA_FLAGS (rare for IPv6), 
-            # fall back to the header flags
-            if flags is None:
-                flags = msg.get('flags')
-            
-            # Guard against None flags (shouldn't happen but be safe)
-            if flags is None:
-                return None
+        if flags & (ifaddrmsg.IFA_F_TEMPORARY | ifaddrmsg.IFA_F_TENTATIVE |
+                    ifaddrmsg.IFA_F_DEPRECATED | ifaddrmsg.IFA_F_DADFAILED):
+            return None
 
-            logging.debug(f"Received address event: {msg.get_attr('IFA_ADDRESS')} with flags {msg.get_attr('IFA_FLAGS')}")
-
-            # Select ONLY MAC-derived addresses (EUI-64):
-            # Must have PERMANENT flag and NOT have TEMPORARY flag
-            #if not (flags & ifaddrmsg.IFA_F_PERMANENT):
-            #    return None
-
-            if flags & (ifaddrmsg.IFA_F_TEMPORARY | 
-                        ifaddrmsg.IFA_F_TENTATIVE |
-                        ifaddrmsg.IFA_F_DEPRECATED |
-                        ifaddrmsg.IFA_F_DADFAILED):
-                return None
-
-            # 2. Filter for Global Scope (Public addresses)
-            # Scope 0 is 'universe' (global), 253 is 'link'
-            if msg.get('scope') == 0:
-                result = msg.get_attr('IFA_ADDRESS')
-                if result is not None and not result.startswith('fdde:'):
-                    return result
-
+        if msg.get('scope') == 0:
+            result = msg.get_attr('IFA_ADDRESS')
+            if result is not None and not result.startswith('fdde:'):
+                return result
         return None
 
     def _propagate_update(self, new_ip, reason="Change", force_update=False):
-        for ddns_service in self.ddns_services:
-            # 15s delay to ensure the address is fully 'preferred' by the OS
-            ddns_service.schedule_update(new_ip, reason, force_update, delay=15)
+        for service in self.ddns_services:
+            service.schedule_update(new_ip, reason, force_update, delay=15)
 
     def monitor_loop(self):
         try:
@@ -181,13 +154,13 @@ class DDNSService:
         self.heartbeat_interval = heartbeat_interval
         self.update_url = update_url
         self.retry_delay = retry_delay
-        self.max_backoff = retry_delay * 32  # Max 32x backoff to prevent excessive delays
+        self.max_backoff = min(retry_delay * 32, 86400)  # Cap max backoff at 24 hours
+        self.max_retry_attempts = 5  # Stop retrying after 5 attempts
 
         # State tracking
         self.last_ip = self._load_last_ip()
-        self.last_update_time = time.time()
-        self._retry_pending = False  # Flag to track if retry is scheduled
-        self._consecutive_failures = 0  # Track consecutive failures for exponential backoff
+        self._retry_pending = False
+        self._consecutive_failures = 0
 
         self.timer_lock = threading.Lock()
         self.update_timer = None
@@ -207,27 +180,29 @@ class DDNSService:
     def schedule_update(self, new_ip, reason="Change", force_update=False, delay=15):
         """Thread-safe method to schedule an IP update with a delay."""
         with self.timer_lock:
-            # Cancel any pending update timer
-            if self.update_timer is not None and self.update_timer.is_alive():
-                self.update_timer.cancel()
-            # Cancel retry timer
-            if self.retry_timer is not None and self.retry_timer.is_alive():
-                self.retry_timer.cancel()
-            # Cancel heartbeat to prevent overlapping updates during the delay window
-            if self.heartbeat_timer is not None and self.heartbeat_timer.is_alive():
-                self.heartbeat_timer.cancel()
-
+            timers_to_cancel = [self.update_timer, self.retry_timer, self.heartbeat_timer]
+        # Cancel timers outside lock to reduce contention
+        for timer in timers_to_cancel:
+            if timer is not None and timer.is_alive():
+                timer.cancel()
+        with self.timer_lock:
             self.update_timer = threading.Timer(delay, self.update_ip, args=(new_ip, reason, force_update))
             self.update_timer.start()
 
     def _schedule_next_heartbeat(self):
-        """Schedule next heartbeat without canceling current timer (avoids re-entrance)."""
+        """Schedule next heartbeat."""
         with self.timer_lock:
             self.heartbeat_timer = threading.Timer(self.heartbeat_interval, self._send_heartbeat)
             self.heartbeat_timer.start()
 
+    def _cancel_timers(self):
+        """Cancel all active timers."""
+        for timer in [self.update_timer, self.retry_timer, self.heartbeat_timer]:
+            if timer is not None and timer.is_alive():
+                timer.cancel()
+
     def _restart_heartbeat(self):
-        """Restart heartbeat by canceling current timer and scheduling new one."""
+        """Restart heartbeat timer."""
         with self.timer_lock:
             if self.heartbeat_timer is not None and self.heartbeat_timer.is_alive():
                 self.heartbeat_timer.cancel()
@@ -251,14 +226,9 @@ class DDNSService:
                 self._retry_pending = False
 
     def cleanup(self):
-        """Cancel all timers"""
+        """Cancel all timers."""
         with self.timer_lock:
-            if self.update_timer is not None and self.update_timer.is_alive():
-                self.update_timer.cancel()
-            if self.retry_timer is not None and self.retry_timer.is_alive():
-                self.retry_timer.cancel()
-            if self.heartbeat_timer is not None and self.heartbeat_timer.is_alive():
-                self.heartbeat_timer.cancel()
+            self._cancel_timers()
 
     def _response_ok(self, result: str) -> bool:
         """Return True if the DDNS provider response indicates success."""
@@ -276,64 +246,50 @@ class DDNSService:
 
     def update_ip(self, new_ip, reason="Change", force_update=False):
         """Thread-safe update with state persistence."""
-        # Check state and determine if update is needed (with lock)
         with self.timer_lock:
-            now = time.time()
-            # Skip if IP is identical unless it's a forced update
             if new_ip is None or (new_ip == self.last_ip and not force_update):
                 self._restart_heartbeat()
                 return
-
             update_url = self.update_url.replace("<ipv6address>", new_ip)
         
-        # Perform network I/O outside of lock to avoid lock contention
-        result = None
         try:
             logging.info(f"[{self.name}] Updating DDNS ({reason}): {new_ip}")
-            req = urllib.request.Request(
-                f"{update_url}", 
-                headers={'User-Agent': self.user_agent}
-            )
-
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(urllib.request.Request(update_url, 
+                    headers={'User-Agent': self.user_agent}), timeout=10) as resp:
                 result = resp.read().decode('utf-8').strip()
                 logging.info(f"[{self.name}] API Response: {result}")
-
                 if not self._response_ok(result):
                     raise ValueError(f"[{self.name}] Negative response from provider: {result}")
 
-            # Update state after successful response (with lock)
             with self.timer_lock:
                 self.last_ip = new_ip
-                self.last_update_time = now
-                self._consecutive_failures = 0  # Reset failure counter on success
-                # Use atomic write to prevent corruption
+                self._consecutive_failures = 0
                 try:
-                    # Ensure parent directory exists
                     self.state_file.parent.mkdir(parents=True, exist_ok=True)
                     with tempfile.NamedTemporaryFile(mode='w', dir=self.state_file.parent, 
                                                      delete=False, encoding='utf-8') as tmp:
                         tmp.write(new_ip)
-                        tmp_path = tmp.name
-                    # Atomic rename
-                    pathlib.Path(tmp_path).replace(self.state_file)
+                    pathlib.Path(tmp.name).replace(self.state_file)
                 except OSError as e:
                     logging.error(f"[{self.name}] Failed to write state file: {e}")
 
         except Exception as e:
             logging.error(f"[{self.name}] API Update Failed: {e}")
             with self.timer_lock:
-                self._consecutive_failures += 1  # Increment failure counter
-                # Calculate backoff with exponential growth: retry_delay * (2 ^ failures)
-                backoff_delay = min(self.retry_delay * (2 ** (self._consecutive_failures - 1)), self.max_backoff)
-                self._retry_pending = True  # Mark retry as pending
-                if self.retry_timer is not None and self.retry_timer.is_alive():
-                    self.retry_timer.cancel()
-                logging.info(f"[{self.name}] Scheduling retry in {backoff_delay}s (attempt {self._consecutive_failures})")
-                self.retry_timer = threading.Timer(backoff_delay, self._do_retry, args=(new_ip,))
-                self.retry_timer.start()
+                self._consecutive_failures += 1
+                # Stop retrying after max attempts reached
+                if self._consecutive_failures >= self.max_retry_attempts:
+                    logging.warning(f"[{self.name}] Max retry attempts ({self.max_retry_attempts}) reached. Giving up.")
+                    self._retry_pending = False
+                else:
+                    backoff_delay = min(self.retry_delay * (2 ** (self._consecutive_failures - 1)), self.max_backoff)
+                    self._retry_pending = True
+                    if self.retry_timer is not None and self.retry_timer.is_alive():
+                        self.retry_timer.cancel()
+                    logging.info(f"[{self.name}] Scheduling retry in {backoff_delay}s (attempt {self._consecutive_failures}/{self.max_retry_attempts})")
+                    self.retry_timer = threading.Timer(backoff_delay, self._do_retry, args=(new_ip,))
+                    self.retry_timer.start()
         finally:
-            # Only restart heartbeat if not being called from heartbeat itself
             if reason != "Heartbeat":
                 self._restart_heartbeat()
 
