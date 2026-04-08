@@ -179,11 +179,20 @@ class DNSUpdater:
                "error" not in resp and "fail" not in resp
     
     def _cancel_timers(self, exclude=None):
-        """Cancel all active timers except specified ones."""
-        for key, timer in list(self._timers.items()):
-            if key != exclude and timer and timer.is_alive():
-                timer.cancel()
-                del self._timers[key]
+        """Cancel and remove all timers except the specified one.
+        
+        Always removes entries from dict to prevent stale Timer objects.
+        Must be called with self._lock held by the caller.
+        """
+        for key in list(self._timers.keys()):
+            if key == exclude:
+                continue
+            timer = self._timers.pop(key, None)
+            if timer:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
     
     def _do_update(self, ip, is_heartbeat=False):
         """Perform DDNS update."""
@@ -220,8 +229,17 @@ class DNSUpdater:
                 else:
                     delay = min(self.retry_delay * (2 ** (self.failures - 1)), self.max_backoff)
                     logging.info(f"[{self.name}] Retry in {delay}s (attempt {self.failures}/{self.max_failures})")
-                    self._timers['retry'] = threading.Timer(delay, self._do_update, (ip, False))
-                    self._timers['retry'].start()
+                    # Cancel any existing retry timer before creating new one
+                    old_retry = self._timers.pop('retry', None)
+                    if old_retry:
+                        try:
+                            old_retry.cancel()
+                        except Exception:
+                            pass
+                    rt = threading.Timer(delay, self._do_update, (ip, False))
+                    rt.daemon = True
+                    self._timers['retry'] = rt
+                    rt.start()
                     return
         finally:
             self._schedule_heartbeat()
@@ -231,15 +249,33 @@ class DNSUpdater:
         with self._lock:
             self._cancel_timers(exclude='retry')
             if self.last_ip:
-                self._timers['heartbeat'] = threading.Timer(self.heartbeat_interval, self._do_update, (self.last_ip, True))
-                self._timers['heartbeat'].start()
+                # Cancel any existing heartbeat timer before creating new one
+                old_hb = self._timers.pop('heartbeat', None)
+                if old_hb:
+                    try:
+                        old_hb.cancel()
+                    except Exception:
+                        pass
+                t = threading.Timer(self.heartbeat_interval, self._do_update, (self.last_ip, True))
+                t.daemon = True
+                self._timers['heartbeat'] = t
+                t.start()
     
     def on_ip_change(self, ip, reason):
         """Handle IP address change."""
         with self._lock:
             self._cancel_timers()  # Cancel all timers including retry for old IP
-            self._timers['update'] = threading.Timer(15, self._do_update, (ip, False))
-            self._timers['update'].start()
+            # Cancel any existing update timer before creating new one
+            old_update = self._timers.pop('update', None)
+            if old_update:
+                try:
+                    old_update.cancel()
+                except Exception:
+                    pass
+            ut = threading.Timer(15, self._do_update, (ip, False))
+            ut.daemon = True
+            self._timers['update'] = ut
+            ut.start()
     
     def stop(self):
         """Stop all timers."""
