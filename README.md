@@ -4,12 +4,21 @@ example configuration file:
 
 <code>
 {
-  "interface_name": "enp1s0f0",
-  "ddns_providers": {
-    "spdyn": {
-      "update_url": "https://update.spdyn.de/nic/update?hostname=MY_HOSTNAME.spdns.de&myip=<ipv6address>&user=MY_USERNAME.spdns.de&pass=MY_TOKEN"
+  "monitored_interface": "enp1s0f0",
+  "state_dir": "/var/tmp/ddnsmart",
+  "poll_interval": 60,
+  "debounce_delay": 15.0,
+  "retry_interval": 900,
+  "heartbeat_interval": 86400,
+  "request_timeout": 30,
+  "max_retries": 5,
+  "providers": [
+    {
+      "name": "spdyn",
+      "update_url": "https://update.spdyn.de/nic/update?hostname=HOSTNAME&myip={ipv6}&user=USERNAME&pass=TOKEN",
+      "method": "GET"
     }
-  }
+  ]
 }
 </code>
 

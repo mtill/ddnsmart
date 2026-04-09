@@ -1,375 +1,311 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""IPv6 DDNS Monitor — watches for IPv6 changes and updates DDNS providers."""
 
+import json
+import logging
+import sys
+import threading
 import time
 import socket
-import logging
-import threading
-import urllib.request
-import json
-import sys
-import pathlib
-import signal
 import tempfile
+from pathlib import Path
+
+import requests
 from pyroute2 import IPRoute
-from pyroute2.netlink.rtnl import ifaddrmsg
+from pyroute2.netlink.rtnl import RTMGRP_IPV6_IFADDR, ifaddrmsg
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-# Global registry for cleanup
-interfaces = []
-services = []
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 
-class IPMonitor:
-    """Monitor IPv6 address changes and trigger DDNS updates."""
-    
-    def __init__(self, interface_name, handlers, check_interval=900):
-        with IPRoute() as ipr:
-            links = ipr.link_lookup(ifname=interface_name)
-            if not links:
-                raise ValueError(f"Interface {interface_name} not found")
-            self.interface_index = links[0]
-        
-        self.interface_name = interface_name
-        self.handlers = handlers
-        self.check_interval = check_interval
-        self._stop = False
-        self._threads = []
-    
-    def _get_ipv6(self):
-        """Get current public IPv6 address."""
-        try:
-            with IPRoute() as ipr:
-                for msg in ipr.get_addr(index=self.interface_index, family=socket.AF_INET6, scope=0):
-                    addr = self.parse_ipv6_address(msg, check_event=False)
-                    if addr:
-                        return addr
-        except Exception as e:
-            logging.error(f"Error getting IPv6 for {self.interface_name}: {e}")
-        return None
-    
-    def parse_ipv6_address(self, msg, check_event=True):
-        """Parse and validate IPv6 address from netlink message."""
-        # Only check for RTM_NEWADDR event when processing live netlink events
-        # Skip event check when parsing static address records from get_addr()
-        if check_event and msg.get('event') != "RTM_NEWADDR":
-            return None
-        if msg.get('family') != socket.AF_INET6:
-            return None
-        if msg.get('index') != self.interface_index:
-            return None
-        
-        flags = msg.get_attr('IFA_FLAGS') or msg.get('flags')
-        if flags is None:
-            return None
-        
-        if flags & (ifaddrmsg.IFA_F_TEMPORARY | ifaddrmsg.IFA_F_TENTATIVE |
-                    ifaddrmsg.IFA_F_DEPRECATED | ifaddrmsg.IFA_F_DADFAILED):
-            return None
-        
-        if msg.get('scope') == 0:
-            addr = msg.get_attr('IFA_ADDRESS')
-            if addr and not addr.startswith('fdde:'):
-                return addr
-        return None
-    
-    def _monitor_kernel(self):
-        """Listen for kernel IPv6 address change events."""
-        try:
-            with IPRoute() as ipr:
-                ipr.bind()
-                while not self._stop:
-                    for msg in ipr.get():
-                        if self._stop or msg.get('index') != self.interface_index:
-                            continue
-                        addr = self.parse_ipv6_address(msg)
-                        if addr:
-                            for h in self.handlers:
-                                try:
-                                    h(addr, "kernel")
-                                except Exception as e:
-                                    logging.error(f"Handler error for {self.interface_name}: {e}")
-        except Exception as e:
-            logging.error(f"Kernel monitor failed for {self.interface_name}: {e}")
-    
-    def _periodic_check(self):
-        """Periodically check IPv6 address."""
-        while not self._stop:
-            time.sleep(self.check_interval)
-            if not self._stop:
-                addr = self._get_ipv6()
-                if addr:
-                    for h in self.handlers:
-                        try:
-                            h(addr, "periodic")
-                        except Exception as e:
-                            logging.error(f"Handler error for {self.interface_name}: {e}")
-    
-    def start(self):
-        """Start monitoring."""
-        addr = self._get_ipv6()
-        if addr:
-            for h in self.handlers:
-                h(addr, "startup")
-        
-        for target in [self._monitor_kernel, self._periodic_check]:
-            t = threading.Thread(target=target, daemon=True)
-            t.start()
-            self._threads.append(t)
-    
-    def stop(self):
-        """Stop monitoring."""
-        self._stop = True
-        for t in self._threads:
-            t.join(timeout=5)
+class DdnsUpdater:
+    """Manages DDNS provider updates with retry logic and state persistence."""
 
-
-class DNSUpdater:
-    """Handle DDNS updates with retry logic and heartbeat."""
-    
-    def __init__(self, name, update_url, state_file, retry_delay=300, heartbeat_interval=86400, user_agent="ddclient/3.10.0"):
-        if not update_url or not update_url.strip():
-            raise ValueError(f"update_url cannot be empty for {name}")
-        
-        self.name = name
-        self.update_url = update_url
-        self.state_file = pathlib.Path(state_file)
-        self.retry_delay = retry_delay
-        self.heartbeat_interval = heartbeat_interval
-        self.user_agent = user_agent
-        self.max_backoff = min(retry_delay * 32, 86400)
-        
-        self.last_ip = self._read_state()
-        self.failures = 0
-        self.max_failures = 5
+    def __init__(self, providers: list[dict], retry_interval: int, request_timeout: int,
+                 max_retries: int, state_dir: Path | None):
+        self._providers = providers
+        self._base_retry = retry_interval
+        self._max_retries = max_retries
+        self._timeout = request_timeout
+        self._state_dir = state_dir
         self._lock = threading.Lock()
-        self._timers = {}
-        
-        self._schedule_heartbeat()
-        logging.info(f"[{name}] Initialized with heartbeat every {heartbeat_interval}s")
-    
-    def _read_state(self):
-        """Read last known IP from state file."""
-        try:
-            return self.state_file.read_text().strip()
-        except FileNotFoundError:
-            return None
-    
-    def _write_state(self, ip):
-        """Atomically write state file."""
-        try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode='w', dir=self.state_file.parent, delete=False, encoding='utf-8') as f:
-                f.write(ip)
-            pathlib.Path(f.name).replace(self.state_file)
-        except Exception as e:
-            logging.error(f"[{self.name}] Failed to write state: {e}")
-    
-    def _is_success(self, response):
-        """Check if response indicates success."""
-        if not response:
-            return False
-        resp = response.strip().lower()
-        return resp.startswith(("good", "ok", "success", "nochg")) and \
-               "error" not in resp and "fail" not in resp
-    
-    def _cancel_timers(self, exclude=None):
-        """Cancel and remove all timers except the specified one.
-        
-        Always removes entries from dict to prevent stale Timer objects.
-        Must be called with self._lock held by the caller.
-        """
-        for key in list(self._timers.keys()):
-            if key == exclude:
-                continue
-            timer = self._timers.pop(key, None)
-            if timer:
-                try:
-                    timer.cancel()
-                except Exception:
-                    pass
-    
-    def _do_update(self, ip, is_heartbeat=False):
-        """Perform DDNS update."""
-        should_schedule_hb = False
-        url = None
-        with self._lock:
-            if ip is None or (ip == self.last_ip and not is_heartbeat):
-                should_schedule_hb = True
-            else:
-                url = self.update_url.replace("<ipv6address>", ip)
-        
-        if should_schedule_hb:
-            self._schedule_heartbeat()
-            return
-        
-        try:
-            logging.info(f"[{self.name}] Updating: {ip}")
-            with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': self.user_agent}), timeout=10) as resp:
-                response = resp.read().decode('utf-8').strip()
-                logging.info(f"[{self.name}] Response: {response}")
-                if not self._is_success(response):
-                    raise ValueError(f"Provider rejected: {response}")
-            
-            with self._lock:
-                self.last_ip = ip
-                self.failures = 0
-                self._write_state(ip)
-        except Exception as e:
-            logging.error(f"[{self.name}] Update failed: {e}")
-            with self._lock:
-                self.failures += 1
-                if self.failures >= self.max_failures:
-                    logging.warning(f"[{self.name}] Max retries ({self.max_failures}) reached")
-                else:
-                    delay = min(self.retry_delay * (2 ** (self.failures - 1)), self.max_backoff)
-                    logging.info(f"[{self.name}] Retry in {delay}s (attempt {self.failures}/{self.max_failures})")
-                    # Cancel any existing retry timer before creating new one
-                    old_retry = self._timers.pop('retry', None)
-                    if old_retry:
-                        try:
-                            old_retry.cancel()
-                        except Exception:
-                            pass
-                    rt = threading.Timer(delay, self._do_update, (ip, False))
-                    rt.daemon = True
-                    self._timers['retry'] = rt
-                    rt.start()
-                    return
-        finally:
-            self._schedule_heartbeat()
-    
-    def _schedule_heartbeat(self):
-        """Schedule next heartbeat."""
-        with self._lock:
-            self._cancel_timers(exclude='retry')
-            if self.last_ip:
-                # Cancel any existing heartbeat timer before creating new one
-                old_hb = self._timers.pop('heartbeat', None)
-                if old_hb:
-                    try:
-                        old_hb.cancel()
-                    except Exception:
-                        pass
-                t = threading.Timer(self.heartbeat_interval, self._do_update, (self.last_ip, True))
-                t.daemon = True
-                self._timers['heartbeat'] = t
-                t.start()
-    
-    def on_ip_change(self, ip, reason):
-        """Handle IP address change."""
-        with self._lock:
-            self._cancel_timers()  # Cancel all timers including retry for old IP
-            # Cancel any existing update timer before creating new one
-            old_update = self._timers.pop('update', None)
-            if old_update:
-                try:
-                    old_update.cancel()
-                except Exception:
-                    pass
-            ut = threading.Timer(15, self._do_update, (ip, False))
-            ut.daemon = True
-            self._timers['update'] = ut
-            ut.start()
-    
-    def stop(self):
-        """Stop all timers."""
-        with self._lock:
-            self._cancel_timers()
+        # provider name -> (next_retry_time, failure_count)
+        self._pending: dict[str, tuple[float, int]] = {}
+        self._last_ip: dict[str, str] = {}  # provider name -> last successful IP
+        if state_dir:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            for p in providers:
+                saved = self._read_state(p["name"])
+                if saved:
+                    self._last_ip[p["name"]] = saved
 
+    def _state_path(self, name: str) -> Path | None:
+        return self._state_dir / f"{name}.ip" if self._state_dir else None
 
-def load_config(path):
-    """Load and validate configuration."""
-    try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError as e:
-        logging.error(f"Invalid JSON in {path}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Failed to read {path}: {e}")
+    def _read_state(self, name: str) -> str | None:
+        path = self._state_path(name)
+        if path and path.exists():
+            return path.read_text().strip()
         return None
 
-
-def main():
-    """Main application loop."""
-    config_dir = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent / "config"
-    
-    if not config_dir.is_dir():
-        logging.error(f"Config directory not found: {config_dir}")
-        sys.exit(1)
-    
-    logging.info(f"Loading config from: {config_dir}")
-    
-    for config_file in config_dir.glob("*.json"):
-        config = load_config(config_file)
-        if not config:
-            continue
-        
-        check_interval = config.get("check_interval", 900)
-        if not isinstance(check_interval, int) or check_interval < 1:
-            logging.warning(f"Invalid check_interval in {config_file}, using 900")
-            check_interval = 900
-        
-        updaters = []
-        for provider_name, provider_cfg in config.get("ddns_providers", {}).items():
+    def _write_state(self, name: str, ipv6: str) -> None:
+        path = self._state_path(name)
+        if path:
             try:
-                state_file = provider_cfg.get("state_file") or f"/var/tmp/ddnsmart_{provider_name}_ipv6.txt"
-                updater = DNSUpdater(
-                    name=provider_name,
-                    update_url=provider_cfg.get("update_url", ""),
-                    state_file=state_file,
-                    retry_delay=provider_cfg.get("retry_delay", 300),
-                    heartbeat_interval=provider_cfg.get("heartbeat_interval", 86400),
-                    user_agent=provider_cfg.get("user_agent", "ddclient/3.10.0")
-                )
-                updaters.append(updater)
-                services.append(updater)
-            except Exception as e:
-                logging.error(f"Failed to initialize {provider_name}: {e}")
-        
-        if not updaters:
-            logging.warning(f"No valid providers in {config_file}")
-            continue
-        
-        interface_name = config.get("interface_name")
-        if not interface_name or not interface_name.strip():
-            logging.error(f"Missing interface_name in {config_file}")
-            continue
-        
+                tmp = tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False, suffix=".tmp")
+                tmp.write(ipv6)
+                tmp.close()
+                Path(tmp.name).replace(path)
+            except OSError as e:
+                log.error("Failed to write state for %s: %s", name, e)
+
+    def update_all(self, ipv6: str, force: bool = False) -> None:
+        for p in self._providers:
+            with self._lock:
+                if not force and self._last_ip.get(p["name"]) == ipv6:
+                    continue
+                # Reset failure count when IP changes
+                old = self._pending.get(p["name"])
+                if old and self._last_ip.get(p["name"]) != ipv6:
+                    self._pending.pop(p["name"], None)
+            self._try_update(p, ipv6)
+
+    def process_retries(self, ipv6: str) -> None:
+        now = time.time()
+        with self._lock:
+            due = [name for name, (ts, _) in self._pending.items() if ts <= now]
+        for name in due:
+            p = next((p for p in self._providers if p["name"] == name), None)
+            if p:
+                self._try_update(p, ipv6)
+
+    def _try_update(self, provider: dict, ipv6: str) -> None:
+        name = provider["name"]
+        if self._send_update(provider, ipv6):
+            with self._lock:
+                self._pending.pop(name, None)
+                self._last_ip[name] = ipv6
+            self._write_state(name, ipv6)
+        else:
+            with self._lock:
+                _, fails = self._pending.get(name, (0, 0))
+                fails += 1
+                if fails <= self._max_retries:
+                    delay = min(self._base_retry * (2 ** (fails - 1)), 86400)
+                    self._pending[name] = (time.time() + delay, fails)
+                    log.info("Retry %s in %ds (attempt %d/%d)", name, delay, fails, self._max_retries)
+                else:
+                    self._pending.pop(name, None)
+                    log.warning("Max retries reached for %s, giving up", name)
+
+    def _send_update(self, provider: dict, ipv6: str) -> bool:
+        url = provider["update_url"].replace("{ipv6}", ipv6)
+        method = provider.get("method", "GET").upper()
+        auth = (provider["username"], provider["password"]) if provider.get("username") else None
+        headers = provider.get("headers", {})
         try:
-            monitor = IPMonitor(
-                interface_name=interface_name,
-                handlers=[u.on_ip_change for u in updaters],
-                check_interval=check_interval
-            )
-            monitor.start()
-            interfaces.append(monitor)
-        except Exception as e:
-            logging.error(f"Failed to start monitor for {interface_name}: {e}")
-    
-    def cleanup(signum=None, frame=None):
-        logging.info("Shutting down...")
-        for m in interfaces:
-            m.stop()
-        for s in services:
-            s.stop()
-        logging.shutdown()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGHUP, cleanup)
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        cleanup()
+            resp = requests.request(method, url, headers=headers, auth=auth, timeout=self._timeout)
+            if resp.ok:
+                log.info("Updated %s -> %s", provider["name"], ipv6)
+                return True
+            log.warning("Update %s failed: HTTP %s", provider["name"], resp.status_code)
+        except requests.RequestException as e:
+            log.error("Update %s failed: %s", provider["name"], e)
+        return False
+
+
+class Ipv6Monitor:
+    """Detects IPv6 address changes via netlink events and polling."""
+
+    def __init__(self, interface: str | None, poll_interval: int, debounce_delay: float = 15.0):
+        self._interface = interface
+        self._poll_interval = poll_interval
+        self._debounce_delay = debounce_delay
+        self._debounce: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._current: str | None = None
+        self._shutdown = threading.Event()
+        self._netlink_ipr: IPRoute | None = None
+        self._on_change: list = []
+
+    @property
+    def current(self) -> str | None:
+        with self._lock:
+            return self._current
+
+    @property
+    def shutdown(self) -> threading.Event:
+        return self._shutdown
+
+    def on_change(self, callback) -> None:
+        self._on_change.append(callback)
+
+    def stop(self) -> None:
+        self._shutdown.set()
+        # Close the netlink socket so ipr.get() unblocks
+        if self._netlink_ipr:
+            try:
+                self._netlink_ipr.close()
+            except Exception:
+                pass
+
+    def get_global_ipv6(self) -> str | None:
+        with IPRoute() as ipr:
+            if self._interface:
+                idx = ipr.link_lookup(ifname=self._interface)
+                if not idx:
+                    return None
+                addrs = ipr.get_addr(family=socket.AF_INET6, index=idx[0], scope=0)
+            else:
+                addrs = ipr.get_addr(family=socket.AF_INET6, scope=0)
+            for addr in addrs:
+                flags = addr.get_attr("IFA_FLAGS") or addr.get("flags") or 0
+                if flags & (ifaddrmsg.IFA_F_TEMPORARY |
+                            ifaddrmsg.IFA_F_TENTATIVE |
+                            ifaddrmsg.IFA_F_DEPRECATED |
+                            ifaddrmsg.IFA_F_DADFAILED):
+                    continue
+                val = addr.get_attr("IFA_ADDRESS")
+                if val and not val.startswith(("fe80:", "fd")):
+                    return val
+        return None
+
+    def set_if_changed(self, ipv6: str) -> bool:
+        with self._lock:
+            if ipv6 == self._current:
+                return False
+            self._current = ipv6
+            # Debounce: absorb rapid netlink bursts before notifying
+            if self._debounce:
+                self._debounce.cancel()
+            self._debounce = threading.Timer(self._debounce_delay, self._fire_callbacks, (ipv6,))
+            self._debounce.daemon = True
+            self._debounce.start()
+        log.info("IPv6 changed: %s", ipv6)
+        return True
+
+    def set_immediate(self, ipv6: str) -> bool:
+        """Set address and fire callbacks immediately (for startup seeding)."""
+        with self._lock:
+            if ipv6 == self._current:
+                return False
+            self._current = ipv6
+        log.info("IPv6 set: %s", ipv6)
+        self._fire_callbacks(ipv6)
+        return True
+
+    def _fire_callbacks(self, ipv6: str) -> None:
+        for cb in self._on_change:
+            cb(ipv6)
+
+    def run_netlink(self) -> None:
+        """Primary: listen for netlink address events."""
+        log.info("Netlink monitor started")
+        ipr = IPRoute()
+        self._netlink_ipr = ipr
+        try:
+            ipr.bind(groups=RTMGRP_IPV6_IFADDR)
+            while not self._shutdown.is_set():
+                try:
+                    for msg in ipr.get():
+                        if msg.get("event") in ("RTM_NEWADDR", "RTM_DELADDR"):
+                            ipv6 = self.get_global_ipv6()
+                            if ipv6:
+                                self.set_if_changed(ipv6)
+                except Exception:
+                    if self._shutdown.is_set():
+                        break
+                    log.exception("Netlink error, retrying in 5s")
+                    time.sleep(5)
+        finally:
+            self._netlink_ipr = None
+            ipr.close()
+
+    def run_poll(self) -> None:
+        """Safety net: poll at fixed intervals."""
+        log.info("Poll monitor started (every %ds)", self._poll_interval)
+        while not self._shutdown.is_set():
+            self._shutdown.wait(self._poll_interval)
+            if self._shutdown.is_set():
+                break
+            ipv6 = self.get_global_ipv6()
+            if ipv6:
+                self.set_if_changed(ipv6)
+
+
+class Ipv6DdnsService:
+    """Ties monitoring, updating, retries, and heartbeats together."""
+
+    def __init__(self, config_path: Path):
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        retry_interval = cfg.get("retry_interval", 900)
+        self._heartbeat_interval = cfg.get("heartbeat_interval", 86400)
+        state_dir = Path(cfg["state_dir"]) if cfg.get("state_dir") else None
+
+        self._monitor = Ipv6Monitor(
+            interface=cfg.get("monitored_interface"),
+            poll_interval=cfg.get("poll_interval", 1800),
+            debounce_delay=cfg.get("debounce_delay", 15.0),
+        )
+        self._updater = DdnsUpdater(
+            providers=cfg.get("providers", []),
+            retry_interval=retry_interval,
+            request_timeout=cfg.get("request_timeout", 30),
+            max_retries=cfg.get("max_retries", 5),
+            state_dir=state_dir,
+        )
+        self._monitor.on_change(self._updater.update_all)
+        log.info("Loaded %s (%d providers)", config_path, len(cfg.get("providers", [])))
+
+    def run(self) -> None:
+        # seed current address
+        ipv6 = self._monitor.get_global_ipv6()
+        if ipv6:
+            log.info("Initial IPv6: %s", ipv6)
+            self._monitor.set_immediate(ipv6)
+        else:
+            log.warning("No global IPv6 at startup")
+
+        threads = [
+            threading.Thread(target=self._monitor.run_netlink, name="netlink", daemon=True),
+            threading.Thread(target=self._monitor.run_poll, name="poller", daemon=True),
+            threading.Thread(target=self._retry_and_heartbeat, name="retry-hb", daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        try:
+            self._monitor.shutdown.wait()
+        except KeyboardInterrupt:
+            log.info("Shutting down")
+            self._monitor.stop()
+            for t in threads:
+                t.join(timeout=10)
+
+    def _retry_and_heartbeat(self) -> None:
+        last_hb = time.time()
+        while not self._monitor.shutdown.is_set():
+            self._monitor.shutdown.wait(60)
+            if self._monitor.shutdown.is_set():
+                break
+            ipv6 = self._monitor.current
+            if not ipv6:
+                continue
+            self._updater.process_retries(ipv6)
+            if time.time() - last_hb >= self._heartbeat_interval:
+                last_hb = time.time()
+                log.info("Heartbeat: %s", ipv6)
+                self._updater.update_all(ipv6, force=True)
+
+
+def main() -> None:
+    path = Path(sys.argv[1])
+    if path.exists():
+        Ipv6DdnsService(path).run()
+    else:
+        log.error("Config not found: %s", path)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
